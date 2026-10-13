@@ -15,6 +15,7 @@ import { deriveSelectorProviders, selectorProviderForSegment, type SelectorProvi
 import { createMixer, type digico } from './mixers.js'
 import { IpadRelay } from './ipadRelay.js'
 import { OSC_QUERY_TIMEOUT_MS, type OSCValue } from './osc.js'
+import { getKnobPresets, getKnobVariableValues } from './knobs.js'
 import {
 	entityRecordDefinitions,
 	entityRoots,
@@ -66,6 +67,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private lastSeen = 0
 	private consoleOnline = false
 	private heartbeatTimer: ReturnType<typeof setInterval> | undefined
+	/** Called whenever a cached value changes (used by the knob layer to refresh variables). */
+	public onValueChange: ((path: string) => void) | undefined
 	private definitionsTimer: ReturnType<typeof setTimeout> | undefined
 
 	constructor(internal: unknown) {
@@ -79,7 +82,25 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.updateVariableDefinitions()
 		this.publishCounts()
 		this.setVariableValues({ filename: '' })
+		this.onValueChange = () => this.refreshKnobValues()
 		this.startRuntime()
+	}
+
+	private knobTimer: ReturnType<typeof setTimeout> | undefined
+
+	/** Re-publish knob-layer variables and feedbacks (batched: faders can move many times a second). */
+	public refreshKnobValues(): void {
+		if (this.knobTimer) return
+		this.knobTimer = setTimeout(() => {
+			this.knobTimer = undefined
+			this.setVariableValues(getKnobVariableValues(this))
+			this.checkFeedbacks('strip_muted', 'strip_soloed', 'sel_is', 'sel_muted', 'snapshot_is', 'console_online')
+		}, 50)
+	}
+
+	private updateKnobPresets(): void {
+		const { structure, presets } = getKnobPresets(this)
+		this.setPresetDefinitions(structure as any, presets as any)
 	}
 
 	async destroy(): Promise<void> {
@@ -101,7 +122,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	public send_osc(path: string, args: OSCSomeArguments): void {
 		this.mixer?.sendOsc(path, args)
-		// Remember what we sent. Toggles and relative steps read the cache, and with
+		// Remember what we sent. Toggles and relative/knob steps read the cache, and with
 		// "Suppress OSC Retransmit" on the console never echoes our own changes back.
 		const list = (Array.isArray(args) ? args : [args]) as Array<{ type?: string; value?: unknown } | undefined>
 		const first = list[0]
@@ -109,6 +130,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.localSetAt.set(path, Date.now())
 			this.storeValue(path, truncateFloat(first.value) as number)
 		}
+	}
+
+	/** Cached value for a path, if known. */
+	public getCached(path: string): JsonValue | undefined {
+		return this.dataStore.get(path)
 	}
 
 	private storeValue(path: string, value: JsonValue): void {
@@ -119,6 +145,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			.filter(([, watchedPath]) => watchedPath === path)
 			.map(([feedbackId]) => feedbackId)
 		if (feedbackIds.length) this.checkFeedbacksById(...feedbackIds)
+		this.onValueChange?.(path)
 	}
 
 	public forwardConsoleOscPacket(packet: Buffer): void {
@@ -507,6 +534,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			.filter(([, watchedPath]) => watchedPath === path)
 			.map(([feedbackId]) => feedbackId)
 		if (changed && feedbackIds.length) this.checkFeedbacksById(...feedbackIds)
+		if (changed) this.onValueChange?.(path)
 		if (newEntityRecord && root) for (const resolve of this.entityRefreshWaiters.get(root) ?? []) resolve()
 		this.actionRecorder.record(path, incoming, this.commandRows)
 		const provider = this.selectorProviders.find((entry) => entry.countPath === path)
@@ -585,6 +613,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.publishCounts()
 		this.updateActions()
 		this.updateFeedbacks()
+		this.updateVariableDefinitions()
+		this.updateKnobPresets()
+		this.refreshKnobValues()
+		// Read the levels the knob layer shows (names were read during discovery).
+		void this.getOscValueOrQuery('/Snapshots/Current_Snapshot').catch(() => null)
 	}
 
 	private async discoverEntityLists(generation: number): Promise<void> {
@@ -611,6 +644,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.definitionsTimer = undefined
 			this.updateActions()
 			this.updateFeedbacks()
+			this.updateVariableDefinitions()
+			this.updateKnobPresets()
+			this.refreshKnobValues()
 		}, 100)
 	}
 
@@ -636,6 +672,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.consoleOnline = true
 		this.hadConnection = true
 		this.updateStatus(InstanceStatus.Ok)
+		this.onValueChange?.('/Console/Name')
 		if (wasDown) {
 			logger.info('Console is back: refreshing everything')
 			this.dataStore.clear()
@@ -658,6 +695,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			if (this.consoleOnline && quietFor > 15000) {
 				this.consoleOnline = false
 				this.updateStatus(InstanceStatus.Disconnected, 'No reply from the console for 15 s')
+				this.onValueChange?.('/Console/Name')
 			}
 		}, 5000)
 	}
@@ -667,8 +705,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.heartbeatTimer = undefined
 	}
 
+	public get isConsoleOnline(): boolean {
+		return this.consoleOnline
+	}
+
 	private async stopRuntime(): Promise<void> {
 		this.stopHeartbeat()
+		if (this.knobTimer) clearTimeout(this.knobTimer)
+		this.knobTimer = undefined
 		this.discoveryGeneration++
 		this.pendingValueReads.clear()
 		if (this.definitionsTimer) clearTimeout(this.definitionsTimer)

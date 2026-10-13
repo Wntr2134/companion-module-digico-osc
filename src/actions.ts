@@ -22,6 +22,7 @@ import {
 } from './commandTable.js'
 import { getMappedChoices, getValueSelectorPath } from './valueMappings.js'
 import { getEntityRecordDefinition, hasEntityRoot } from './entityRecords.js'
+import { getKnobActions } from './knobs.js'
 
 const logger = createModuleLogger('action')
 
@@ -516,5 +517,6 @@ export function UpdateActions(self: ModuleInstance, rows: CommandRow[]): void {
 		}
 		actions[id] = action
 	}
+	Object.assign(actions, getKnobActions(self))
 	self.setActionDefinitions(actions)
 }
